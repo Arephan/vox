@@ -41,6 +41,10 @@ def find_claude():
     return "claude"  # fallback, hope it's in PATH
 
 CLAUDE_BIN = find_claude()
+# Ensure node is in PATH (claude is a Node.js script)
+_claude_dir = os.path.dirname(CLAUDE_BIN)
+if _claude_dir and _claude_dir not in os.environ.get("PATH", ""):
+    os.environ["PATH"] = _claude_dir + ":" + os.environ.get("PATH", "")
 print(f"[vox] Claude: {CLAUDE_BIN}", flush=True)
 
 # Keep whisper loaded for speed
