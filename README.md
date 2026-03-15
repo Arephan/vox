@@ -19,6 +19,11 @@ Press **Option+Shift+A** from anywhere on your Mac → speak → Claude responds
 2. Drag **Vox** to Applications
 3. Open Vox — it will prompt to install dependencies on first launch
 
+If macOS blocks the app, run this in Terminal:
+```bash
+xattr -cr /Applications/Vox.app
+```
+
 ### Requirements
 
 - macOS 13+ on Apple Silicon (M1/M2/M3/M4)
