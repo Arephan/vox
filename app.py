@@ -108,6 +108,7 @@ def query_claude(text, model, image_path=None):
     model_ids = {
         "haiku": "claude-haiku-4-5-20251001",
         "sonnet": "claude-sonnet-4-6",
+        "opus": "claude-opus-4-6",
     }
     model_id = model_ids.get(model, "claude-haiku-4-5-20251001")
 
@@ -172,10 +173,18 @@ class VoxApp(rumps.App):
         self.stream = None
         self.busy = False
         self.last_signal_state = False
+        self.current_model = "auto"  # auto, haiku, sonnet, opus
+
         self.menu = [
             rumps.MenuItem("Talk", callback=self.toggle_recording),
             None,
             rumps.MenuItem("Status: Ready"),
+            None,
+            rumps.MenuItem("Model: Auto", callback=None),
+            rumps.MenuItem("  ✓ Auto (Haiku/Sonnet)", callback=self.set_model_auto),
+            rumps.MenuItem("    Haiku (fast)", callback=self.set_model_haiku),
+            rumps.MenuItem("    Sonnet (balanced)", callback=self.set_model_sonnet),
+            rumps.MenuItem("    Opus (powerful)", callback=self.set_model_opus),
             None,
             rumps.MenuItem("Stop Speech", callback=self.on_stop_speech),
         ]
@@ -259,10 +268,13 @@ class VoxApp(rumps.App):
         self.set_status(f"You: {text[:50]}")
         self.title = "💭"
 
-        work_keywords = ["build", "create", "write", "fix", "edit", "code",
-                         "implement", "refactor", "deploy", "install", "make"]
-        is_work = any(kw in text.lower() for kw in work_keywords)
-        model = "sonnet" if is_work else "haiku"
+        if self.current_model == "auto":
+            work_keywords = ["build", "create", "write", "fix", "edit", "code",
+                             "implement", "refactor", "deploy", "install", "make"]
+            is_work = any(kw in text.lower() for kw in work_keywords)
+            model = "sonnet" if is_work else "haiku"
+        else:
+            model = self.current_model
 
         screen_keywords = ["see my screen", "see what I see", "look at my screen",
                            "what's on my screen", "what do you see", "can you see",
@@ -309,6 +321,40 @@ class VoxApp(rumps.App):
         self.set_status("Ready")
         self.title = "Vox"
         self.busy = False
+
+    def _update_model_menu(self):
+        labels = {"auto": "Auto (Haiku/Sonnet)", "haiku": "Haiku (fast)",
+                  "sonnet": "Sonnet (balanced)", "opus": "Opus (powerful)"}
+        for key, label in labels.items():
+            menu_key = f"  ✓ {label}" if self.current_model == key else f"    {label}"
+            old_checked = f"  ✓ {label}"
+            old_unchecked = f"    {label}"
+            for item in self.menu.values():
+                if isinstance(item, rumps.MenuItem) and item.title in (old_checked, old_unchecked):
+                    item.title = menu_key
+                    break
+        # Update header
+        model_name = labels[self.current_model].split(" (")[0]
+        for item in self.menu.values():
+            if isinstance(item, rumps.MenuItem) and item.title.startswith("Model:"):
+                item.title = f"Model: {model_name}"
+                break
+
+    def set_model_auto(self, sender):
+        self.current_model = "auto"
+        self._update_model_menu()
+
+    def set_model_haiku(self, sender):
+        self.current_model = "haiku"
+        self._update_model_menu()
+
+    def set_model_sonnet(self, sender):
+        self.current_model = "sonnet"
+        self._update_model_menu()
+
+    def set_model_opus(self, sender):
+        self.current_model = "opus"
+        self._update_model_menu()
 
     def on_stop_speech(self, sender):
         stop_speech()
