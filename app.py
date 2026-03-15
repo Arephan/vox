@@ -367,7 +367,7 @@ def query_claude_tmux(text, image_path=None):
 
 class VoxApp(rumps.App):
     def __init__(self):
-        super().__init__("Vox", title="Vox")
+        super().__init__("Vox", title="🎙")
         self.recording = False
         self.audio_frames = []
         self.stream = None
@@ -515,6 +515,8 @@ class VoxApp(rumps.App):
         if wants_screen:
             self.set_status("Capturing screen...")
             screenshot = "/tmp/vox-screen.png"
+
+            # Try 1: Swift helper (shows as "Vox" in permissions)
             try:
                 os.unlink("/tmp/vox-screenshot-done")
             except OSError:
@@ -528,11 +530,17 @@ class VoxApp(rumps.App):
                 os.unlink("/tmp/vox-screenshot-done")
             except OSError:
                 pass
-            if os.path.exists(screenshot):
+
+            # Try 2: Fall back to screencapture if Swift helper didn't work
+            if not os.path.exists(screenshot) or os.path.getsize(screenshot) < 1000:
+                print("[vox] Swift helper didn't capture, falling back to screencapture", flush=True)
+                subprocess.run(["screencapture", "-x", screenshot], capture_output=True)
+
+            if os.path.exists(screenshot) and os.path.getsize(screenshot) > 1000:
                 image_path = screenshot
                 print(f"[vox] screenshot ready ({os.path.getsize(screenshot)} bytes)", flush=True)
             else:
-                text += " (screen capture failed)"
+                text += " (screen capture failed — grant Screen Recording permission to Vox in System Settings)"
                 print("[vox] screenshot failed", flush=True)
 
         try:
