@@ -10,6 +10,46 @@ class VoxHelper: NSObject, NSApplicationDelegate {
         let venvPython = "\(home)/kokoro-env/bin/python3.10"
         let resourcePath = Bundle.main.resourcePath ?? "."
         let appScript = "\(resourcePath)/app.py"
+        let installScript = "\(resourcePath)/install.sh"
+
+        // First-time setup: check for dependencies
+        if !FileManager.default.fileExists(atPath: venvPython) {
+            let alert = NSAlert()
+            alert.messageText = "Welcome to Vox!"
+            alert.informativeText = "Vox needs to install a few things first:\n\n• Kokoro TTS (local voice)\n• Whisper STT (local speech recognition)\n• Python dependencies\n\nThis takes about 5 minutes.\n\nRequirements:\n• Python 3.10 (brew install python@3.10)\n• Claude Code (logged in)\n• tmux (brew install tmux)"
+            alert.addButton(withTitle: "Install")
+            alert.addButton(withTitle: "Quit")
+            if alert.runModal() == .alertSecondButtonReturn {
+                NSApp.terminate(nil)
+                return
+            }
+
+            let installer = Process()
+            installer.executableURL = URL(fileURLWithPath: "/bin/bash")
+            installer.arguments = [installScript]
+            var ienv = ProcessInfo.processInfo.environment
+            let nvmDir = "\(home)/.nvm/versions/node"
+            if FileManager.default.fileExists(atPath: nvmDir) {
+                if let dirs = try? FileManager.default.contentsOfDirectory(atPath: nvmDir) {
+                    for d in dirs {
+                        ienv["PATH"] = "\(nvmDir)/\(d)/bin:" + (ienv["PATH"] ?? "")
+                    }
+                }
+            }
+            ienv["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + (ienv["PATH"] ?? "")
+            installer.environment = ienv
+            try? installer.run()
+            installer.waitUntilExit()
+
+            if !FileManager.default.fileExists(atPath: venvPython) {
+                let errAlert = NSAlert()
+                errAlert.messageText = "Setup Failed"
+                errAlert.informativeText = "Could not install dependencies.\n\nMake sure you have:\n• Python 3.10: brew install python@3.10\n• tmux: brew install tmux\n• Claude Code logged in\n\nThen reopen Vox."
+                errAlert.runModal()
+                NSApp.terminate(nil)
+                return
+            }
+        }
 
         let modifiers: UInt32 = UInt32(optionKey | shiftKey)
 
