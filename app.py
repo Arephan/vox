@@ -137,6 +137,7 @@ class VoxApp(rumps.App):
         self.set_status("Listening...")
         stop_speech()
 
+
         def audio_callback(indata, frames, time_info, status):
             if self.recording:
                 self.audio_frames.append(indata.copy())
@@ -187,19 +188,67 @@ class VoxApp(rumps.App):
         is_work = any(kw in text.lower() for kw in work_keywords)
         model = "sonnet" if is_work else "haiku"
 
+        # Check if user wants screen context
+        screen_keywords = ["see my screen", "see what I see", "look at my screen",
+                           "what's on my screen", "what do you see", "can you see",
+                           "look at this", "what am I looking at", "screen"]
+        wants_screen = any(kw in text.lower() for kw in screen_keywords)
+
         try:
             env = os.environ.copy()
             env["VOX_NO_HOOK"] = "1"
+            prompt = text
+
+            if wants_screen:
+                self.set_status("Capturing screen...")
+                screenshot = "/tmp/vox-screen.png"
+                # Signal the Swift launcher to take the screenshot (shows as "Vox" in permissions)
+                try:
+                    os.unlink("/tmp/vox-screenshot-done")
+                except OSError:
+                    pass
+                open("/tmp/vox-screenshot-request", "w").close()
+                # Wait for Swift to take it (up to 3 seconds)
+                for _ in range(30):
+                    if os.path.exists("/tmp/vox-screenshot-done"):
+                        break
+                    import time
+                    time.sleep(0.1)
+                try:
+                    os.unlink("/tmp/vox-screenshot-done")
+                except OSError:
+                    pass
+                print(f"[vox] screenshot exists={os.path.exists(screenshot)}", flush=True)
+                if os.path.exists(screenshot):
+                    size = os.path.getsize(screenshot)
+                    print(f"[vox] screenshot size={size} bytes", flush=True)
+                    prompt = f"Read this image file and describe what you see, then answer the user's question.\n\nImage: {screenshot}\n\nUser: {text}"
+                else:
+                    print(f"[vox] screenshot failed", flush=True)
+                    prompt = text + " (Note: I tried to capture the screen but it failed — Vox may need Screen Recording permission in System Settings.)"
+
+            print(f"[vox] sending to claude (model={model})...", flush=True)
             result = subprocess.run(
-                [CLAUDE_BIN, "-p", "--model", model, text],
+                [CLAUDE_BIN, "-p", "--model", model, prompt],
                 capture_output=True, text=True, timeout=300,
                 cwd=os.path.expanduser("~"),
                 env=env
             )
-            response = result.stdout.strip() if result.returncode == 0 else f"Error: {result.stderr.strip()}"
+            response = result.stdout.strip()
+            print(f"[vox] claude exit={result.returncode}, response={response[:100]}", flush=True)
+            if result.returncode != 0:
+                print(f"[vox] claude stderr: {result.stderr[:200]}", flush=True)
+                response = f"Error: {result.stderr.strip()}"
+
+            # Clean up screenshot
+            try:
+                os.unlink("/tmp/vox-screen.png")
+            except OSError:
+                pass
         except subprocess.TimeoutExpired:
             response = "That took too long."
         except Exception as e:
+            print(f"[vox] exception: {e}", flush=True)
             response = f"Error: {e}"
 
         self.title = "🔊"
