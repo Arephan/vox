@@ -140,6 +140,12 @@ def speak_append(text):
 def stop_speech():
     _send_tts("stop")
 
+def notify(title, message):
+    try:
+        rumps.notification(title, "", message, sound=False)
+    except Exception:
+        pass
+
 
 # --- Fast API streaming (for conversation) ---
 
@@ -232,12 +238,21 @@ def _count_response_blocks():
     return pane.count('⏺'), pane
 
 
-def _get_latest_response(pane_content):
-    """Get text from the last ⏺ block."""
+SKIP_PREFIXES = ['Read ', 'Reading ', 'Wrote ', 'Ran ', 'Search', 'plugin:', 'Edit', 'Bash',
+                  'Running', 'running', 'Stop:', 'hook', 'Hook', 'Glob', 'Grep', 'Write',
+                  'Agent', 'Task', 'LSP', 'Bash(']
+SKIP_CONTENT = ['running stop', 'hook', 'bypass permissions', 'mcp server', 'shift+tab',
+                'boogieing', 'thinking', 'moonwalking', 'grooving', 'vibing', 'shimmy',
+                'ctrl+o', 'expand', '/tmp/', '✻', '─────', 'file changed', 'files changed',
+                'sublimating', 'breakdancing']
+
+
+def _get_new_response(pane_content, skip_blocks=0):
+    """Get text from new ⏺ blocks, skipping the first skip_blocks."""
     lines = pane_content.strip().split('\n')
     lines = [re.sub(r'\x1b\[[0-9;]*m', '', l) for l in lines]
 
-    # Find all ⏺ blocks, return the last real text one
+    block_index = 0
     blocks = []
     current = []
     in_block = False
@@ -246,13 +261,12 @@ def _get_latest_response(pane_content):
         s = line.strip()
         if s.startswith('⏺'):
             if current:
-                blocks.append(' '.join(current))
+                blocks.append((block_index, ' '.join(current)))
             current = []
+            block_index += 1
             in_block = True
             text = s[1:].strip()
-            # Skip tool-use blocks
-            if any(text.startswith(k) for k in ['Read ', 'Wrote ', 'Ran ', 'Search', 'plugin:', 'Edit', 'Bash',
-                                                   'Running', 'running', 'Stop:', 'hook', 'Hook']):
+            if any(text.startswith(k) for k in SKIP_PREFIXES):
                 in_block = False
                 continue
             if text:
@@ -266,16 +280,16 @@ def _get_latest_response(pane_content):
                 text = s[1:].strip()
                 if text and not text.startswith('[Image') and not text.startswith('['):
                     current.append(text)
-            elif s and not any(skip in s.lower() for skip in ['running stop', 'hook', 'bypass permissions', 'mcp server', 'shift+tab']):
+            elif s and not any(skip in s.lower() for skip in SKIP_CONTENT):
                 current.append(s)
 
     if current:
-        blocks.append(' '.join(current))
+        blocks.append((block_index, ' '.join(current)))
 
-    # Return last non-empty text block
-    for b in reversed(blocks):
-        if b.strip() and len(b.strip()) > 1:
-            return b.strip()
+    # Return last text block that is NEW (index > skip_blocks)
+    for idx, text in reversed(blocks):
+        if idx > skip_blocks and text.strip() and len(text.strip()) > 1:
+            return text.strip()
     return ""
 
 
@@ -313,7 +327,7 @@ def query_claude_tmux(text, image_path=None):
 
         # Only look at response if new blocks appeared
         if current_count > before_count:
-            response = _get_latest_response(pane)
+            response = _get_new_response(pane, skip_blocks=before_count)
 
             if response and response != last_response:
                 last_response = response
@@ -334,12 +348,13 @@ def query_claude_tmux(text, image_path=None):
             # Check if Claude is done
             if _is_prompt_ready(pane) and response:
                 if not first_spoken:
-                    # Never spoke anything yet — speak the whole response
                     speak(response)
                 else:
                     remaining = response[len(spoken_text):].strip()
                     if remaining:
                         speak_append(remaining)
+                # Show response as notification
+                notify("Vox", response[:150])
                 print(f"[vox] done: {response[:80]}", flush=True)
                 return response
 
@@ -448,7 +463,7 @@ class VoxApp(rumps.App):
         if not self.recording:
             return
         self.recording = False
-        self.title = "Vox"
+        self.title = "🎙"
 
         if self.stream:
             self.stream.stop()
@@ -477,6 +492,7 @@ class VoxApp(rumps.App):
 
         self.set_status(f"You: {text[:50]}")
         self.title = "💭"
+        notify("Vox", f"🎤 \"{text[:60]}...\"" if len(text) > 60 else f"🎤 \"{text}\"")
 
         # Determine model
         work_keywords = ["build", "create", "write", "fix", "edit", "code",
@@ -532,7 +548,7 @@ class VoxApp(rumps.App):
 
         self.title = "🔊"
         self.set_status("Ready")
-        self.title = "Vox"
+        self.title = "🎙"
         self.busy = False
 
     def on_stop_speech(self, sender):
