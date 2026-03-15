@@ -12,8 +12,9 @@ class VoxHelper: NSObject, NSApplicationDelegate {
         let appScript = "\(resourcePath)/app.py"
         let installScript = "\(resourcePath)/install.sh"
 
-        // First-time setup: check for dependencies
-        if !FileManager.default.fileExists(atPath: venvPython) {
+        // First-time setup: check for venv AND server script
+        let serverScript = "\(home)/bin/kokoro-server.py"
+        if !FileManager.default.fileExists(atPath: venvPython) || !FileManager.default.fileExists(atPath: serverScript) {
             let alert = NSAlert()
             alert.messageText = "Welcome to Vox!"
             alert.informativeText = "Vox needs to install a few things first:\n\n• Kokoro TTS (local voice)\n• Whisper STT (local speech recognition)\n• Python dependencies\n\nThis takes about 5 minutes.\n\nRequirements:\n• Python 3.10 (brew install python@3.10)\n• Claude Code (logged in)\n• tmux (brew install tmux)"
@@ -48,6 +49,20 @@ class VoxHelper: NSObject, NSApplicationDelegate {
                 errAlert.runModal()
                 NSApp.terminate(nil)
                 return
+            }
+        }
+
+        // Start kokoro-server if not running
+        if !FileManager.default.fileExists(atPath: "/tmp/kokoro-tts.sock") {
+            if FileManager.default.fileExists(atPath: serverScript) {
+                NSLog("[vox] Starting kokoro-server...")
+                let server = Process()
+                server.executableURL = URL(fileURLWithPath: venvPython)
+                server.arguments = [serverScript]
+                var senv = ProcessInfo.processInfo.environment
+                senv["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+                server.environment = senv
+                try? server.run()
             }
         }
 
