@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
-import shutil
-import sys
+import base64
+import json
 import os
+import re
+import socket
+import subprocess
+import tempfile
+import threading
+
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 import warnings
 warnings.filterwarnings("ignore")
@@ -10,48 +16,51 @@ import numpy as np
 import rumps
 import sounddevice as sd
 import soundfile as sf
-import threading
-import json
-import socket
-import subprocess
-import tempfile
+import anthropic
 
 KOKORO_SOCK = "/tmp/kokoro-tts.sock"
 SAMPLE_RATE = 16000
 
-# Find claude binary dynamically
-def find_claude():
-    # Check PATH first
-    found = shutil.which("claude")
-    if found:
-        return found
-    # Common locations
-    home = os.path.expanduser("~")
-    candidates = [
-        os.path.join(home, ".nvm/versions/node", d, "bin/claude")
-        for d in os.listdir(os.path.join(home, ".nvm/versions/node")) if os.path.isdir(os.path.join(home, ".nvm/versions/node", d))
-    ] if os.path.isdir(os.path.join(home, ".nvm/versions/node")) else []
-    candidates += [
-        "/usr/local/bin/claude",
-        "/opt/homebrew/bin/claude",
-    ]
-    for c in candidates:
-        if os.path.isfile(c):
-            return c
-    return "claude"  # fallback, hope it's in PATH
-
-CLAUDE_BIN = find_claude()
-# Ensure node is in PATH (claude is a Node.js script)
-_claude_dir = os.path.dirname(CLAUDE_BIN)
-if _claude_dir and _claude_dir not in os.environ.get("PATH", ""):
-    os.environ["PATH"] = _claude_dir + ":" + os.environ.get("PATH", "")
-print(f"[vox] Claude: {CLAUDE_BIN}", flush=True)
+SYSTEM = (
+    "You are Vox, a voice assistant. Give concise, conversational answers. "
+    "Avoid markdown, bullet points, headers, and code blocks — speak in plain sentences. "
+    "Keep answers short unless asked for detail."
+)
 
 # Keep whisper loaded for speed
 print("[vox] Loading whisper...", flush=True)
 from faster_whisper import WhisperModel
 whisper_model = WhisperModel("base", device="auto")
 print("[vox] Whisper ready", flush=True)
+
+
+def _make_client():
+    """Create Anthropic client using Claude Code's OAuth token."""
+    try:
+        result = subprocess.run(
+            ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            creds = json.loads(result.stdout.strip())
+            token = creds.get("claudeAiOauth", {}).get("accessToken")
+            if token:
+                print("[vox] Using Claude Code OAuth token", flush=True)
+                return anthropic.Anthropic(
+                    auth_token=token,
+                    default_headers={"anthropic-beta": "oauth-2025-04-20"},
+                )
+    except Exception as e:
+        print(f"[vox] OAuth token error: {e}", flush=True)
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if api_key:
+        return anthropic.Anthropic(api_key=api_key)
+
+    raise RuntimeError("No credentials. Set ANTHROPIC_API_KEY or log in to Claude Code.")
+
+
+_client = _make_client()
 
 
 def transcribe(audio_data):
@@ -65,27 +74,77 @@ def transcribe(audio_data):
         os.unlink(tmppath)
 
 
-def speak(text):
-    stop_speech()  # Always stop previous speech first
+def _send_tts(cmd, text=""):
     try:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.settimeout(1)
         sock.connect(KOKORO_SOCK)
-        sock.sendall(json.dumps({"cmd": "speak", "text": text}).encode())
+        sock.sendall(json.dumps({"cmd": cmd, "text": text}).encode())
         sock.close()
     except (ConnectionRefusedError, FileNotFoundError, OSError):
         pass
+
+
+def speak(text):
+    _send_tts("speak", text)
+
+
+def speak_append(text):
+    _send_tts("speak_append", text)
 
 
 def stop_speech():
-    try:
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(1)
-        sock.connect(KOKORO_SOCK)
-        sock.sendall(json.dumps({"cmd": "stop"}).encode())
-        sock.close()
-    except (ConnectionRefusedError, FileNotFoundError, OSError):
-        pass
+    _send_tts("stop")
+
+
+def query_claude_streaming(text, model, image_path=None):
+    """Stream Claude response, speaking first sentence immediately."""
+    model_ids = {
+        "haiku": "claude-haiku-4-5-20251001",
+        "sonnet": "claude-sonnet-4-6",
+    }
+    model_id = model_ids.get(model, "claude-haiku-4-5-20251001")
+
+    if image_path and os.path.exists(image_path):
+        with open(image_path, "rb") as f:
+            img_b64 = base64.standard_b64encode(f.read()).decode()
+        content = [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": img_b64}},
+            {"type": "text", "text": text},
+        ]
+    else:
+        content = text
+
+    buffer = ""
+    first_spoken = False
+
+    with _client.messages.stream(
+        model=model_id,
+        max_tokens=512,
+        system=SYSTEM,
+        messages=[{"role": "user", "content": content}],
+    ) as stream:
+        for chunk in stream.text_stream:
+            buffer += chunk
+            if not first_spoken:
+                m = re.search(r'[.!?][)\'"]*\s', buffer)
+                if m:
+                    speak(buffer[:m.end()])
+                    buffer = buffer[m.end():]
+                    first_spoken = True
+                elif len(buffer) > 200:
+                    word_m = re.search(r'\s\S+$', buffer)
+                    cut = word_m.start() if word_m else len(buffer)
+                    speak(buffer[:cut])
+                    buffer = buffer[cut:]
+                    first_spoken = True
+
+    remaining = buffer.strip()
+    if remaining:
+        if first_spoken:
+            speak_append(remaining)
+        else:
+            speak(remaining)
 
 
 class VoxApp(rumps.App):
@@ -103,13 +162,12 @@ class VoxApp(rumps.App):
             None,
             rumps.MenuItem("Stop Speech", callback=self.on_stop_speech),
         ]
-        # Clean up stale signal
         try:
             os.unlink("/tmp/vox-recording")
         except OSError:
             pass
-        # Poll for hotkey signal
-        self._hotkey_timer = rumps.Timer(self._check_hotkey, 0.3)
+        # Tight poll for fast hotkey response
+        self._hotkey_timer = rumps.Timer(self._check_hotkey, 0.05)
         self._hotkey_timer.start()
         print("[vox] Started", flush=True)
 
@@ -141,7 +199,6 @@ class VoxApp(rumps.App):
         self.set_status("Listening...")
         stop_speech()
 
-
         def audio_callback(indata, frames, time_info, status):
             if self.recording:
                 self.audio_frames.append(indata.copy())
@@ -169,7 +226,6 @@ class VoxApp(rumps.App):
 
         audio = np.concatenate(self.audio_frames).flatten()
         self.audio_frames = []
-
         threading.Thread(target=self._process_audio, args=(audio,), daemon=True).start()
 
     def _process_audio(self, audio):
@@ -192,71 +248,48 @@ class VoxApp(rumps.App):
         is_work = any(kw in text.lower() for kw in work_keywords)
         model = "sonnet" if is_work else "haiku"
 
-        # Check if user wants screen context
         screen_keywords = ["see my screen", "see what I see", "look at my screen",
                            "what's on my screen", "what do you see", "can you see",
                            "look at this", "what am I looking at", "screen"]
         wants_screen = any(kw in text.lower() for kw in screen_keywords)
 
+        image_path = None
+        if wants_screen:
+            self.set_status("Capturing screen...")
+            screenshot = "/tmp/vox-screen.png"
+            try:
+                os.unlink("/tmp/vox-screenshot-done")
+            except OSError:
+                pass
+            open("/tmp/vox-screenshot-request", "w").close()
+            import time
+            for _ in range(30):
+                if os.path.exists("/tmp/vox-screenshot-done"):
+                    break
+                time.sleep(0.1)
+            try:
+                os.unlink("/tmp/vox-screenshot-done")
+            except OSError:
+                pass
+            if os.path.exists(screenshot):
+                image_path = screenshot
+                print(f"[vox] screenshot ready ({os.path.getsize(screenshot)} bytes)", flush=True)
+            else:
+                text += " (Note: screen capture failed — Vox may need Screen Recording permission.)"
+                print("[vox] screenshot failed", flush=True)
+
         try:
-            env = os.environ.copy()
-            env["VOX_NO_HOOK"] = "1"
-            prompt = text
-
-            if wants_screen:
-                self.set_status("Capturing screen...")
-                screenshot = "/tmp/vox-screen.png"
-                # Signal the Swift launcher to take the screenshot (shows as "Vox" in permissions)
-                try:
-                    os.unlink("/tmp/vox-screenshot-done")
-                except OSError:
-                    pass
-                open("/tmp/vox-screenshot-request", "w").close()
-                # Wait for Swift to take it (up to 3 seconds)
-                for _ in range(30):
-                    if os.path.exists("/tmp/vox-screenshot-done"):
-                        break
-                    import time
-                    time.sleep(0.1)
-                try:
-                    os.unlink("/tmp/vox-screenshot-done")
-                except OSError:
-                    pass
-                print(f"[vox] screenshot exists={os.path.exists(screenshot)}", flush=True)
-                if os.path.exists(screenshot):
-                    size = os.path.getsize(screenshot)
-                    print(f"[vox] screenshot size={size} bytes", flush=True)
-                    prompt = f"Read this image file and describe what you see, then answer the user's question.\n\nImage: {screenshot}\n\nUser: {text}"
-                else:
-                    print(f"[vox] screenshot failed", flush=True)
-                    prompt = text + " (Note: I tried to capture the screen but it failed — Vox may need Screen Recording permission in System Settings.)"
-
-            print(f"[vox] sending to claude (model={model})...", flush=True)
-            result = subprocess.run(
-                [CLAUDE_BIN, "-p", "--model", model, prompt],
-                capture_output=True, text=True, timeout=300,
-                cwd=os.path.expanduser("~"),
-                env=env
-            )
-            response = result.stdout.strip()
-            print(f"[vox] claude exit={result.returncode}, response={response[:100]}", flush=True)
-            if result.returncode != 0:
-                print(f"[vox] claude stderr: {result.stderr[:200]}", flush=True)
-                response = f"Error: {result.stderr.strip()}"
-
-            # Clean up screenshot
+            self.set_status("Thinking...")
+            query_claude_streaming(text, model, image_path=image_path)
             try:
                 os.unlink("/tmp/vox-screen.png")
             except OSError:
                 pass
-        except subprocess.TimeoutExpired:
-            response = "That took too long."
         except Exception as e:
-            print(f"[vox] exception: {e}", flush=True)
-            response = f"Error: {e}"
+            print(f"[vox] error: {e}", flush=True)
+            speak("Sorry, something went wrong.")
 
         self.title = "🔊"
-        speak(response)
         self.set_status("Ready")
         self.title = "Vox"
         self.busy = False
