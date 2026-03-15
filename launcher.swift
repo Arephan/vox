@@ -11,19 +11,47 @@ class VoxHelper: NSObject, NSApplicationDelegate {
         let resourcePath = Bundle.main.resourcePath ?? "."
         let appScript = "\(resourcePath)/app.py"
 
-        // Register Option+Shift+A hotkey
-        var hotKeyRef: EventHotKeyRef?
         let modifiers: UInt32 = UInt32(optionKey | shiftKey)
-        let keyCode: UInt32 = 0x00
-        let hotKeyID = EventHotKeyID(signature: OSType(0x564F5821), id: 1)
-        RegisterEventHotKey(keyCode, modifiers, hotKeyID, GetApplicationEventTarget(), 0, &hotKeyRef)
 
+        // Register Option+Shift+A — toggle recording (key code 0x00 = 'a')
+        var talkKeyRef: EventHotKeyRef?
+        let talkKeyID = EventHotKeyID(signature: OSType(0x564F5821), id: 1)
+        RegisterEventHotKey(0x00, modifiers, talkKeyID, GetApplicationEventTarget(), 0, &talkKeyRef)
+
+        // Register Option+Shift+S — stop speech (key code 0x01 = 's')
+        var stopKeyRef: EventHotKeyRef?
+        let stopKeyID = EventHotKeyID(signature: OSType(0x564F5822), id: 2)
+        RegisterEventHotKey(0x01, modifiers, stopKeyID, GetApplicationEventTarget(), 0, &stopKeyRef)
+
+        // Single event handler that dispatches based on hotkey ID
         var eventSpec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
         InstallEventHandler(GetApplicationEventTarget(), { (_, event, _) -> OSStatus in
-            let toggle = Process()
-            toggle.executableURL = URL(fileURLWithPath: "/bin/bash")
-            toggle.arguments = ["-c", "if [ -f /tmp/vox-recording ]; then rm /tmp/vox-recording; else touch /tmp/vox-recording; fi"]
-            try? toggle.run()
+            var hotkeyID = EventHotKeyID()
+            GetEventParameter(event!, EventParamName(kEventParamDirectObject),
+                              EventParamType(typeEventHotKeyID), nil,
+                              MemoryLayout<EventHotKeyID>.size, nil, &hotkeyID)
+
+            let task = Process()
+            task.executableURL = URL(fileURLWithPath: "/bin/bash")
+
+            if hotkeyID.id == 1 {
+                // Toggle recording
+                task.arguments = ["-c", "if [ -f /tmp/vox-recording ]; then rm /tmp/vox-recording; else touch /tmp/vox-recording; fi"]
+            } else if hotkeyID.id == 2 {
+                // Stop speech
+                task.arguments = ["-c", """
+                    python3 -c "
+                    import socket, json
+                    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    s.settimeout(1)
+                    s.connect('/tmp/kokoro-tts.sock')
+                    s.sendall(json.dumps({'cmd':'stop'}).encode())
+                    s.close()
+                    " 2>/dev/null
+                    """]
+            }
+
+            try? task.run()
             return noErr
         }, 1, &eventSpec, nil, nil)
 
@@ -43,7 +71,6 @@ class VoxHelper: NSObject, NSApplicationDelegate {
         var env = ProcessInfo.processInfo.environment
         env["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
         env["VOX_NO_HOOK"] = "1"
-        // Ensure node/claude are in PATH
         let extraPaths = [
             "\(home)/.nvm/versions/node",
             "/usr/local/bin",
@@ -75,7 +102,6 @@ class VoxHelper: NSObject, NSApplicationDelegate {
             NSLog("[vox] Failed to launch Python: \(error)")
         }
 
-        // Monitor Python — if it dies, quit Vox
         DispatchQueue.global().async {
             python.waitUntilExit()
             NSLog("[vox] Python exited, shutting down")
@@ -84,7 +110,7 @@ class VoxHelper: NSObject, NSApplicationDelegate {
             }
         }
 
-        NSLog("[vox] Vox running — Option+Shift+A to talk")
+        NSLog("[vox] Vox running — Opt+Shift+A to talk, Opt+Shift+S to stop speech")
     }
 
     func takeScreenshot() {
