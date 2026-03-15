@@ -61,16 +61,25 @@ Vox runs as **two processes** launched from one `Vox.app`:
 - If memory is a concern, can load/unload per transcription (adds ~4 seconds latency)
 - Requires Python 3.10 — faster-whisper/ctranslate2 don't support 3.11+
 
-### Claude Code integration
-- Uses `claude -p --model <model> <prompt>` for non-interactive calls
+### Claude API integration
+- **Current approach (fast)**: Uses Anthropic Python SDK directly with Claude Code's OAuth token
+- OAuth token extracted from macOS Keychain: `security find-generic-password -s "Claude Code-credentials" -w`
+- Requires header `anthropic-beta: oauth-2025-04-20` for OAuth auth to work
+- Streams responses via `_client.messages.stream()` — speaks first sentence as soon as it arrives
+- Uses `speak()` for first sentence, `speak_append()` for remaining text
 - Haiku for conversation (fast), Sonnet for work tasks (detects keywords like "build", "create", "fix", "code")
-- `VOX_NO_HOOK=1` env var prevents the Claude Code Stop hook from double-speaking responses
-- `--continue` flag was removed — it loaded heavy session context and was too slow
+- **Important**: No conversation persistence yet — each call is stateless. Need to implement message history.
+
+#### Previous approaches (abandoned)
+- `claude -p` subprocess: Too slow (2-5 seconds before any output), no streaming
+- `claude -p --continue`: Loaded heavy session context, often timed out
+- `claude -p --output-format stream-json --verbose`: Worked but still slower than direct API
+- OAuth without `anthropic-beta` header: Returns 401 authentication error
 
 ### Screenshot for screen sharing
 - Only triggered when user says keywords: "see my screen", "look at this", "what do you see", etc.
-- Screenshot is saved to `/tmp/vox-screen.png` (~10MB PNG)
-- Claude reads it via file path in the prompt: `"Read this image file... Image: /tmp/vox-screen.png"`
+- Screenshot taken by Swift helper via `CGDisplayCreateImage` (shows as "Vox" in permissions)
+- Sent to Claude as base64 PNG in the API call
 - Cleaned up after each use
 
 ## File structure

@@ -97,8 +97,16 @@ def stop_speech():
     _send_tts("stop")
 
 
+# Conversation history — keeps context across messages
+# Cap at 20 messages (10 turns) to avoid token bloat
+_conversation_history = []
+MAX_HISTORY = 20
+
+
 def query_claude_streaming(text, model, image_path=None):
-    """Stream Claude response, speaking first sentence immediately."""
+    """Stream Claude response, speaking first sentence immediately. Maintains conversation history."""
+    global _conversation_history
+
     model_ids = {
         "haiku": "claude-haiku-4-5-20251001",
         "sonnet": "claude-sonnet-4-6",
@@ -108,24 +116,32 @@ def query_claude_streaming(text, model, image_path=None):
     if image_path and os.path.exists(image_path):
         with open(image_path, "rb") as f:
             img_b64 = base64.standard_b64encode(f.read()).decode()
-        content = [
+        user_content = [
             {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": img_b64}},
             {"type": "text", "text": text},
         ]
     else:
-        content = text
+        user_content = text
+
+    _conversation_history.append({"role": "user", "content": user_content})
+
+    # Trim history if too long
+    if len(_conversation_history) > MAX_HISTORY:
+        _conversation_history = _conversation_history[-MAX_HISTORY:]
 
     buffer = ""
+    full_response = ""
     first_spoken = False
 
     with _client.messages.stream(
         model=model_id,
         max_tokens=512,
         system=SYSTEM,
-        messages=[{"role": "user", "content": content}],
+        messages=_conversation_history,
     ) as stream:
         for chunk in stream.text_stream:
             buffer += chunk
+            full_response += chunk
             if not first_spoken:
                 m = re.search(r'[.!?][)\'"]*\s', buffer)
                 if m:
@@ -145,6 +161,10 @@ def query_claude_streaming(text, model, image_path=None):
             speak_append(remaining)
         else:
             speak(remaining)
+
+    # Save assistant response to history
+    if full_response:
+        _conversation_history.append({"role": "assistant", "content": full_response})
 
 
 class VoxApp(rumps.App):
