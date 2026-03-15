@@ -62,6 +62,10 @@ def _make_client():
 
 _client = _make_client()
 
+# Conversation history
+_conversation_history = []
+MAX_HISTORY = 20
+
 
 def transcribe(audio_data):
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
@@ -97,14 +101,8 @@ def stop_speech():
     _send_tts("stop")
 
 
-# Conversation history — keeps context across messages
-# Cap at 20 messages (10 turns) to avoid token bloat
-_conversation_history = []
-MAX_HISTORY = 20
-
-
-def query_claude_streaming(text, model, image_path=None):
-    """Stream Claude response, speaking first sentence immediately. Maintains conversation history."""
+def query_claude(text, model, image_path=None):
+    """Stream Claude response via API, speak first sentence immediately."""
     global _conversation_history
 
     model_ids = {
@@ -124,8 +122,6 @@ def query_claude_streaming(text, model, image_path=None):
         user_content = text
 
     _conversation_history.append({"role": "user", "content": user_content})
-
-    # Trim history if too long
     if len(_conversation_history) > MAX_HISTORY:
         _conversation_history = _conversation_history[-MAX_HISTORY:]
 
@@ -162,9 +158,10 @@ def query_claude_streaming(text, model, image_path=None):
         else:
             speak(remaining)
 
-    # Save assistant response to history
     if full_response:
         _conversation_history.append({"role": "assistant", "content": full_response})
+
+    print(f"[vox] response: {full_response[:100]}", flush=True)
 
 
 class VoxApp(rumps.App):
@@ -186,7 +183,6 @@ class VoxApp(rumps.App):
             os.unlink("/tmp/vox-recording")
         except OSError:
             pass
-        # Tight poll for fast hotkey response
         self._hotkey_timer = rumps.Timer(self._check_hotkey, 0.05)
         self._hotkey_timer.start()
         print("[vox] Started", flush=True)
@@ -300,7 +296,7 @@ class VoxApp(rumps.App):
 
         try:
             self.set_status("Thinking...")
-            query_claude_streaming(text, model, image_path=image_path)
+            query_claude(text, model, image_path=image_path)
             try:
                 os.unlink("/tmp/vox-screen.png")
             except OSError:
