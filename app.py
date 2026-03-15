@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-import base64
 import json
 import os
 import re
@@ -7,6 +6,7 @@ import socket
 import subprocess
 import tempfile
 import threading
+import time
 
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 import warnings
@@ -16,26 +16,21 @@ import numpy as np
 import rumps
 import sounddevice as sd
 import soundfile as sf
+import base64
+import shutil
 import anthropic
 
 KOKORO_SOCK = "/tmp/kokoro-tts.sock"
 SAMPLE_RATE = 16000
+TMUX_SESSION = "vox-claude"
 
 SYSTEM = (
     "You are Vox, a voice assistant. Give concise, conversational answers. "
-    "Avoid markdown, bullet points, headers, and code blocks — speak in plain sentences. "
-    "Keep answers short unless asked for detail."
+    "No markdown, no bullet points, no code blocks. Plain sentences only. "
+    "Keep it short unless asked for detail."
 )
 
-# Keep whisper loaded for speed
-print("[vox] Loading whisper...", flush=True)
-from faster_whisper import WhisperModel
-whisper_model = WhisperModel("base", device="auto")
-print("[vox] Whisper ready", flush=True)
-
-
 def _make_client():
-    """Create Anthropic client using Claude Code's OAuth token."""
     try:
         result = subprocess.run(
             ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
@@ -51,20 +46,66 @@ def _make_client():
                     default_headers={"anthropic-beta": "oauth-2025-04-20"},
                 )
     except Exception as e:
-        print(f"[vox] OAuth token error: {e}", flush=True)
-
+        print(f"[vox] OAuth error: {e}", flush=True)
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if api_key:
         return anthropic.Anthropic(api_key=api_key)
-
-    raise RuntimeError("No credentials. Set ANTHROPIC_API_KEY or log in to Claude Code.")
-
+    raise RuntimeError("No credentials")
 
 _client = _make_client()
 
-# Conversation history
-_conversation_history = []
+# Warm API connection in background
+def _warmup_api():
+    try:
+        _client.messages.create(model="claude-haiku-4-5-20251001", max_tokens=1,
+                                messages=[{"role": "user", "content": "hi"}])
+        print("[vox] API warm", flush=True)
+    except Exception:
+        pass
+threading.Thread(target=_warmup_api, daemon=True).start()
+
+# Persistent conversation history
+HISTORY_FILE = os.path.expanduser("~/.vox_history.json")
 MAX_HISTORY = 20
+
+def _load_history():
+    try:
+        with open(HISTORY_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+def _save_history(history):
+    with open(HISTORY_FILE, "w") as f:
+        json.dump(history[-MAX_HISTORY:], f)
+
+_conversation_history = _load_history()
+
+# Find claude
+def _find_claude():
+    found = shutil.which("claude")
+    if found:
+        return found
+    home = os.path.expanduser("~")
+    nvm_dir = os.path.join(home, ".nvm/versions/node")
+    if os.path.isdir(nvm_dir):
+        for d in os.listdir(nvm_dir):
+            c = os.path.join(nvm_dir, d, "bin/claude")
+            if os.path.isfile(c):
+                return c
+    return "claude"
+
+CLAUDE_BIN = _find_claude()
+_claude_dir = os.path.dirname(CLAUDE_BIN)
+if _claude_dir:
+    os.environ["PATH"] = _claude_dir + ":" + os.environ.get("PATH", "")
+print(f"[vox] Claude: {CLAUDE_BIN}", flush=True)
+
+# Keep whisper loaded
+print("[vox] Loading whisper...", flush=True)
+from faster_whisper import WhisperModel
+whisper_model = WhisperModel("base", device="auto")
+print("[vox] Whisper ready", flush=True)
 
 
 def transcribe(audio_data):
@@ -88,28 +129,24 @@ def _send_tts(cmd, text=""):
     except (ConnectionRefusedError, FileNotFoundError, OSError):
         pass
 
-
 def speak(text):
+    print(f"[vox] SPEAK: {text[:80]}", flush=True)
     _send_tts("speak", text)
 
-
 def speak_append(text):
+    print(f"[vox] SPEAK_APPEND: {text[:80]}", flush=True)
     _send_tts("speak_append", text)
-
 
 def stop_speech():
     _send_tts("stop")
 
 
-def query_claude(text, model, image_path=None):
-    """Stream Claude response via API, speak first sentence immediately."""
-    global _conversation_history
+# --- Fast API streaming (for conversation) ---
 
-    model_ids = {
-        "haiku": "claude-haiku-4-5-20251001",
-        "sonnet": "claude-sonnet-4-6",
-        "opus": "claude-opus-4-6",
-    }
+def query_claude_api(text, model, image_path=None):
+    """Stream via Anthropic API — fast, speaks immediately."""
+    global _conversation_history
+    model_ids = {"haiku": "claude-haiku-4-5-20251001", "sonnet": "claude-sonnet-4-6", "opus": "claude-opus-4-6"}
     model_id = model_ids.get(model, "claude-haiku-4-5-20251001")
 
     if image_path and os.path.exists(image_path):
@@ -131,9 +168,7 @@ def query_claude(text, model, image_path=None):
     first_spoken = False
 
     with _client.messages.stream(
-        model=model_id,
-        max_tokens=512,
-        system=SYSTEM,
+        model=model_id, max_tokens=512, system=SYSTEM,
         messages=_conversation_history,
     ) as stream:
         for chunk in stream.text_stream:
@@ -145,11 +180,9 @@ def query_claude(text, model, image_path=None):
                     speak(buffer[:m.end()])
                     buffer = buffer[m.end():]
                     first_spoken = True
-                elif len(buffer) > 200:
-                    word_m = re.search(r'\s\S+$', buffer)
-                    cut = word_m.start() if word_m else len(buffer)
-                    speak(buffer[:cut])
-                    buffer = buffer[cut:]
+                elif len(buffer) > 150:
+                    speak(buffer)
+                    buffer = ""
                     first_spoken = True
 
     remaining = buffer.strip()
@@ -161,8 +194,160 @@ def query_claude(text, model, image_path=None):
 
     if full_response:
         _conversation_history.append({"role": "assistant", "content": full_response})
+        _save_history(_conversation_history)
 
-    print(f"[vox] response: {full_response[:100]}", flush=True)
+    print(f"[vox] api response: {full_response[:80]}", flush=True)
+
+
+# --- tmux Claude session (for tool work) ---
+
+def ensure_tmux():
+    """Start persistent Claude session in tmux if not running."""
+    result = subprocess.run(["tmux", "has-session", "-t", TMUX_SESSION], capture_output=True)
+    if result.returncode == 0:
+        return
+
+    print("[vox] Starting Claude tmux session...", flush=True)
+    subprocess.run(["tmux", "new-session", "-d", "-s", TMUX_SESSION, "-x", "200", "-y", "50"])
+    time.sleep(1)
+
+    cmd = f"VOX_NO_HOOK=1 {CLAUDE_BIN} --model haiku --dangerously-skip-permissions --system-prompt 'You are Vox. Be concise. No markdown, no bullet points. Plain sentences only.'"
+    subprocess.run(["tmux", "send-keys", "-t", TMUX_SESSION, cmd, "Enter"])
+    time.sleep(3)
+
+    # Accept trust prompt
+    pane = subprocess.run(["tmux", "capture-pane", "-t", TMUX_SESSION, "-p"],
+                          capture_output=True, text=True).stdout
+    if "trust" in pane.lower():
+        subprocess.run(["tmux", "send-keys", "-t", TMUX_SESSION, "Enter"])
+        time.sleep(8)
+
+    print("[vox] Claude session ready", flush=True)
+
+
+def _count_response_blocks():
+    """Count ⏺ blocks in current pane."""
+    pane = subprocess.run(["tmux", "capture-pane", "-t", TMUX_SESSION, "-p", "-S", "-100"],
+                          capture_output=True, text=True).stdout
+    return pane.count('⏺'), pane
+
+
+def _get_latest_response(pane_content):
+    """Get text from the last ⏺ block."""
+    lines = pane_content.strip().split('\n')
+    lines = [re.sub(r'\x1b\[[0-9;]*m', '', l) for l in lines]
+
+    # Find all ⏺ blocks, return the last real text one
+    blocks = []
+    current = []
+    in_block = False
+
+    for line in lines:
+        s = line.strip()
+        if s.startswith('⏺'):
+            if current:
+                blocks.append(' '.join(current))
+            current = []
+            in_block = True
+            text = s[1:].strip()
+            # Skip tool-use blocks
+            if any(text.startswith(k) for k in ['Read ', 'Wrote ', 'Ran ', 'Search', 'plugin:', 'Edit', 'Bash',
+                                                   'Running', 'running', 'Stop:', 'hook', 'Hook']):
+                in_block = False
+                continue
+            if text:
+                current.append(text)
+            continue
+        if in_block:
+            if s.startswith('❯') or s.startswith('⏵⏵'):
+                in_block = False
+                continue
+            if s.startswith('⎿'):
+                text = s[1:].strip()
+                if text and not text.startswith('[Image') and not text.startswith('['):
+                    current.append(text)
+            elif s and not any(skip in s.lower() for skip in ['running stop', 'hook', 'bypass permissions', 'mcp server', 'shift+tab']):
+                current.append(s)
+
+    if current:
+        blocks.append(' '.join(current))
+
+    # Return last non-empty text block
+    for b in reversed(blocks):
+        if b.strip() and len(b.strip()) > 1:
+            return b.strip()
+    return ""
+
+
+def _is_prompt_ready(pane_content):
+    """Check if Claude is done (empty ❯ at the bottom)."""
+    lines = pane_content.strip().split('\n')
+    clean = [re.sub(r'\x1b\[[0-9;]*m', '', l).strip() for l in lines[-4:]]
+    return any(l == '❯' for l in clean)
+
+
+def query_claude_tmux(text, image_path=None):
+    """Send message to persistent tmux Claude session, speak response."""
+    ensure_tmux()
+
+    if image_path and os.path.exists(image_path):
+        text = f"Look at this screenshot file and describe what you see: {image_path} — {text}"
+    text = text.replace('\n', ' ').strip()
+
+    # Count blocks before sending
+    before_count, _ = _count_response_blocks()
+
+    # Send message
+    subprocess.run(["tmux", "send-keys", "-t", TMUX_SESSION, "-l", text])
+    subprocess.run(["tmux", "send-keys", "-t", TMUX_SESSION, "Enter"])
+
+    first_spoken = False
+    spoken_text = ""
+    start = time.time()
+    last_response = ""
+
+    time.sleep(0.2)
+
+    while time.time() - start < 60:
+        current_count, pane = _count_response_blocks()
+
+        # Only look at response if new blocks appeared
+        if current_count > before_count:
+            response = _get_latest_response(pane)
+
+            if response and response != last_response:
+                last_response = response
+
+                # Speak as soon as we have ANY text — don't wait for full sentence
+                if not first_spoken and len(response) > 10:
+                    m = re.search(r'[.!?,;:]\s', response)
+                    if m:
+                        speak(response[:m.end()])
+                        spoken_text = response[:m.end()]
+                        first_spoken = True
+                    elif len(response) > 80:
+                        # No punctuation yet, speak what we have
+                        speak(response)
+                        spoken_text = response
+                        first_spoken = True
+
+            # Check if Claude is done
+            if _is_prompt_ready(pane) and response:
+                if not first_spoken:
+                    # Never spoke anything yet — speak the whole response
+                    speak(response)
+                else:
+                    remaining = response[len(spoken_text):].strip()
+                    if remaining:
+                        speak_append(remaining)
+                print(f"[vox] done: {response[:80]}", flush=True)
+                return response
+
+        time.sleep(0.1)
+
+    if not first_spoken:
+        speak("Sorry, that took too long.")
+    return last_response or "timeout"
 
 
 class VoxApp(rumps.App):
@@ -173,7 +358,7 @@ class VoxApp(rumps.App):
         self.stream = None
         self.busy = False
         self.last_signal_state = False
-        self.current_model = "auto"  # auto, haiku, sonnet, opus
+        self.current_model = "auto"
 
         self.menu = [
             rumps.MenuItem("Talk", callback=self.toggle_recording),
@@ -194,6 +379,10 @@ class VoxApp(rumps.App):
             pass
         self._hotkey_timer = rumps.Timer(self._check_hotkey, 0.05)
         self._hotkey_timer.start()
+
+        # Pre-warm tmux session in background
+        threading.Thread(target=ensure_tmux, daemon=True).start()
+
         print("[vox] Started", flush=True)
 
     def _check_hotkey(self, _):
@@ -208,6 +397,27 @@ class VoxApp(rumps.App):
             if isinstance(item, rumps.MenuItem) and item.title.startswith("Status:"):
                 item.title = f"Status: {text}"
                 break
+
+    def _update_model_menu(self):
+        labels = {"auto": "Auto (Haiku/Sonnet)", "haiku": "Haiku (fast)",
+                  "sonnet": "Sonnet (balanced)", "opus": "Opus (powerful)"}
+        for key, label in labels.items():
+            menu_key = f"  ✓ {label}" if self.current_model == key else f"    {label}"
+            old_checked = f"  ✓ {label}"
+            old_unchecked = f"    {label}"
+            for item in self.menu.values():
+                if isinstance(item, rumps.MenuItem) and item.title in (old_checked, old_unchecked):
+                    item.title = menu_key
+                    break
+        for item in self.menu.values():
+            if isinstance(item, rumps.MenuItem) and item.title.startswith("Model:"):
+                item.title = f"Model: {labels[self.current_model].split(' (')[0]}"
+                break
+
+    def set_model_auto(self, _): self.current_model = "auto"; self._update_model_menu()
+    def set_model_haiku(self, _): self.current_model = "haiku"; self._update_model_menu()
+    def set_model_sonnet(self, _): self.current_model = "sonnet"; self._update_model_menu()
+    def set_model_opus(self, _): self.current_model = "opus"; self._update_model_menu()
 
     def toggle_recording(self, sender):
         if self.busy:
@@ -268,14 +478,18 @@ class VoxApp(rumps.App):
         self.set_status(f"You: {text[:50]}")
         self.title = "💭"
 
+        # Determine model
+        work_keywords = ["build", "create", "write", "fix", "edit", "code",
+                         "implement", "refactor", "deploy", "install", "make",
+                         "run", "execute", "delete", "update", "commit", "push"]
         if self.current_model == "auto":
-            work_keywords = ["build", "create", "write", "fix", "edit", "code",
-                             "implement", "refactor", "deploy", "install", "make"]
             is_work = any(kw in text.lower() for kw in work_keywords)
             model = "sonnet" if is_work else "haiku"
         else:
             model = self.current_model
+            is_work = any(kw in text.lower() for kw in work_keywords)
 
+        # Screenshot
         screen_keywords = ["see my screen", "see what I see", "look at my screen",
                            "what's on my screen", "what do you see", "can you see",
                            "look at this", "what am I looking at", "screen"]
@@ -290,7 +504,6 @@ class VoxApp(rumps.App):
             except OSError:
                 pass
             open("/tmp/vox-screenshot-request", "w").close()
-            import time
             for _ in range(30):
                 if os.path.exists("/tmp/vox-screenshot-done"):
                     break
@@ -303,12 +516,12 @@ class VoxApp(rumps.App):
                 image_path = screenshot
                 print(f"[vox] screenshot ready ({os.path.getsize(screenshot)} bytes)", flush=True)
             else:
-                text += " (Note: screen capture failed — Vox may need Screen Recording permission.)"
+                text += " (screen capture failed)"
                 print("[vox] screenshot failed", flush=True)
 
         try:
             self.set_status("Thinking...")
-            query_claude(text, model, image_path=image_path)
+            query_claude_tmux(text, image_path=image_path)
             try:
                 os.unlink("/tmp/vox-screen.png")
             except OSError:
@@ -321,40 +534,6 @@ class VoxApp(rumps.App):
         self.set_status("Ready")
         self.title = "Vox"
         self.busy = False
-
-    def _update_model_menu(self):
-        labels = {"auto": "Auto (Haiku/Sonnet)", "haiku": "Haiku (fast)",
-                  "sonnet": "Sonnet (balanced)", "opus": "Opus (powerful)"}
-        for key, label in labels.items():
-            menu_key = f"  ✓ {label}" if self.current_model == key else f"    {label}"
-            old_checked = f"  ✓ {label}"
-            old_unchecked = f"    {label}"
-            for item in self.menu.values():
-                if isinstance(item, rumps.MenuItem) and item.title in (old_checked, old_unchecked):
-                    item.title = menu_key
-                    break
-        # Update header
-        model_name = labels[self.current_model].split(" (")[0]
-        for item in self.menu.values():
-            if isinstance(item, rumps.MenuItem) and item.title.startswith("Model:"):
-                item.title = f"Model: {model_name}"
-                break
-
-    def set_model_auto(self, sender):
-        self.current_model = "auto"
-        self._update_model_menu()
-
-    def set_model_haiku(self, sender):
-        self.current_model = "haiku"
-        self._update_model_menu()
-
-    def set_model_sonnet(self, sender):
-        self.current_model = "sonnet"
-        self._update_model_menu()
-
-    def set_model_opus(self, sender):
-        self.current_model = "opus"
-        self._update_model_menu()
 
     def on_stop_speech(self, sender):
         stop_speech()
