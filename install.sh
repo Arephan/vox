@@ -34,6 +34,16 @@ if [ -z "$PYTHON" ]; then
 fi
 echo "   Found: $PYTHON"
 
+# 1b. Check for tmux
+echo "→ Checking for tmux..."
+if ! command -v tmux &>/dev/null; then
+    echo ""
+    echo "❌  tmux is required but not found."
+    echo "    Install it with: brew install tmux"
+    exit 1
+fi
+echo "   Found: $(command -v tmux)"
+
 # 2. Create virtualenv
 echo "→ Creating Python virtualenv at $VENV_DIR..."
 if [ ! -d "$VENV_DIR" ]; then
@@ -43,7 +53,7 @@ fi
 # 3. Install dependencies
 echo "→ Installing kokoro, whisper, sounddevice, rumps..."
 "$VENV_DIR/bin/pip" install --quiet --upgrade pip
-"$VENV_DIR/bin/pip" install --quiet kokoro sounddevice numpy soundfile faster-whisper rumps
+"$VENV_DIR/bin/pip" install --quiet kokoro sounddevice numpy soundfile faster-whisper rumps anthropic
 
 # 4. Copy server scripts to ~/bin
 echo "→ Installing scripts to $BIN_DIR..."
@@ -51,7 +61,7 @@ mkdir -p "$BIN_DIR"
 
 VENV_PYTHON="$VENV_DIR/bin/python3"
 
-for script in kokoro-server.py claude-speak.py; do
+for script in kokoro-server.py claude-speak.py kokoro-stop.sh; do
     if [ -f "$REPO_DIR/$script" ]; then
         dest="$BIN_DIR/$script"
         cp "$REPO_DIR/$script" "$dest"

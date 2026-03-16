@@ -516,6 +516,12 @@ class VoxApp(rumps.App):
             self.set_status("Capturing screen...")
             screenshot = "/tmp/vox-screen.png"
 
+            # Delete stale screenshot before capture
+            try:
+                os.unlink(screenshot)
+            except OSError:
+                pass
+
             # Try 1: Swift helper (shows as "Vox" in permissions)
             try:
                 os.unlink("/tmp/vox-screenshot-done")
