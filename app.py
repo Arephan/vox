@@ -207,11 +207,31 @@ def query_claude_api(text, model, image_path=None):
 
 # --- tmux Claude session (for tool work) ---
 
+def _is_claude_alive():
+    """Check if Claude is running and responsive in the tmux session."""
+    result = subprocess.run(["tmux", "has-session", "-t", TMUX_SESSION], capture_output=True)
+    if result.returncode != 0:
+        return False
+    pane = subprocess.run(["tmux", "capture-pane", "-t", TMUX_SESSION, "-p", "-S", "-5"],
+                          capture_output=True, text=True).stdout
+    # If we see a shell prompt (user@host) without Claude's ❯ prompt, Claude isn't running
+    lines = [l.strip() for l in pane.strip().split('\n') if l.strip()]
+    if not lines:
+        return False
+    last = lines[-1]
+    # Claude's input prompt is ❯, shell prompt ends with $ or %
+    if last.endswith('$') or last.endswith('%'):
+        return False
+    return True
+
+
 def ensure_tmux():
     """Start persistent Claude session in tmux if not running."""
-    result = subprocess.run(["tmux", "has-session", "-t", TMUX_SESSION], capture_output=True)
-    if result.returncode == 0:
+    if _is_claude_alive():
         return
+
+    # Kill stale session if Claude died but tmux is still around
+    subprocess.run(["tmux", "kill-session", "-t", TMUX_SESSION], capture_output=True)
 
     print("[vox] Starting Claude tmux session...", flush=True)
     subprocess.run(["tmux", "new-session", "-d", "-s", TMUX_SESSION, "-x", "200", "-y", "50"])
@@ -221,12 +241,17 @@ def ensure_tmux():
     subprocess.run(["tmux", "send-keys", "-t", TMUX_SESSION, cmd, "Enter"])
     time.sleep(3)
 
-    # Accept trust prompt
-    pane = subprocess.run(["tmux", "capture-pane", "-t", TMUX_SESSION, "-p"],
-                          capture_output=True, text=True).stdout
-    if "trust" in pane.lower():
-        subprocess.run(["tmux", "send-keys", "-t", TMUX_SESSION, "Enter"])
-        time.sleep(8)
+    # Accept trust prompt or bypass-permissions prompt
+    for _ in range(10):
+        pane = subprocess.run(["tmux", "capture-pane", "-t", TMUX_SESSION, "-p"],
+                              capture_output=True, text=True).stdout
+        lower = pane.lower()
+        if "trust" in lower or "yes, i accept" in lower or "bypass permissions" in lower:
+            subprocess.run(["tmux", "send-keys", "-t", TMUX_SESSION, "Enter"])
+            time.sleep(2)
+        if "❯" in pane:
+            break
+        time.sleep(1)
 
     print("[vox] Claude session ready", flush=True)
 
@@ -537,10 +562,26 @@ class VoxApp(rumps.App):
             except OSError:
                 pass
 
-            # Try 2: Fall back to screencapture if Swift helper didn't work
-            if not os.path.exists(screenshot) or os.path.getsize(screenshot) < 1000:
-                print("[vox] Swift helper didn't capture, falling back to screencapture", flush=True)
+            # Try 2: Fall back to screencapture
+            # Always try if Swift failed OR if Swift only captured wallpaper
+            # (wallpaper-only captures are valid large PNGs, so size check alone won't catch it)
+            swift_captured = os.path.exists(screenshot) and os.path.getsize(screenshot) > 1000
+            if not swift_captured:
+                print("[vox] Swift helper didn't capture, trying screencapture", flush=True)
                 subprocess.run(["screencapture", "-x", screenshot], capture_output=True)
+            else:
+                # Swift captured something, but try screencapture too and use the larger file
+                # (wallpaper-only is typically smaller than a full screen with windows)
+                alt = "/tmp/vox-screen-alt.png"
+                subprocess.run(["screencapture", "-x", alt], capture_output=True)
+                if os.path.exists(alt) and os.path.getsize(alt) > 1000:
+                    if os.path.getsize(alt) > os.path.getsize(screenshot):
+                        os.replace(alt, screenshot)
+                        print("[vox] Using screencapture (larger than Swift capture)", flush=True)
+                    else:
+                        os.unlink(alt)
+                elif os.path.exists(alt):
+                    os.unlink(alt)
 
             if os.path.exists(screenshot) and os.path.getsize(screenshot) > 1000:
                 image_path = screenshot

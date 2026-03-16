@@ -74,11 +74,13 @@ cd ~/vox
 swiftc launcher.swift -o Vox -framework Cocoa -framework Carbon -framework CoreGraphics
 mkdir -p /Applications/Vox.app/Contents/{MacOS,Resources}
 cp Vox /Applications/Vox.app/Contents/MacOS/
-cp app.py install.sh kokoro-server.py claude-speak.py /Applications/Vox.app/Contents/Resources/
+cp app.py install.sh kokoro-server.py claude-speak.py kokoro-stop.sh /Applications/Vox.app/Contents/Resources/
 # Create Info.plist with LSUIElement=true, NSMicrophoneUsageDescription, NSScreenCaptureUsageDescription
 codesign --force --deep --sign - /Applications/Vox.app
 xattr -cr /Applications/Vox.app
 ```
+
+> **Note:** Re-signing the app invalidates Screen Recording permission. After building from source, you must re-grant Screen Recording to Vox in System Settings > Privacy & Security > Screen Recording.
 
 ### Step 3 — Run first-time setup
 
@@ -93,8 +95,8 @@ bash /Applications/Vox.app/Contents/Resources/install.sh
 ```
 
 This installs:
-- Python virtualenv at `~/kokoro-env` with kokoro, faster-whisper, rumps, sounddevice
-- `~/bin/kokoro-server.py` and `~/bin/claude-speak.py`
+- Python virtualenv at `~/kokoro-env` with kokoro, faster-whisper, rumps, sounddevice, anthropic
+- `~/bin/kokoro-server.py`, `~/bin/claude-speak.py`, and `~/bin/kokoro-stop.sh`
 - launchd service for kokoro-server (auto-starts on login)
 - `shh` alias in ~/.zshrc to stop speech
 
@@ -119,11 +121,27 @@ ps aux | grep -v grep | grep Vox   # Should show Swift launcher
 ps aux | grep -v grep | grep app.py   # Should show Python menu bar
 ```
 
-### Step 5 — Grant permissions
+### Step 5 — Verify the Claude tmux session
+
+On first voice input, Vox creates a Claude Code session in tmux. This may get stuck on prompts:
+
+```bash
+# Check if the session is healthy
+tmux capture-pane -t vox-claude -p | tail -5
+
+# If you see "Yes, I accept" or "trust" prompt, the auto-accept may have missed it:
+tmux send-keys -t vox-claude Enter
+
+# If you see a shell prompt ($) instead of Claude's ❯ prompt, kill and retry:
+tmux kill-session -t vox-claude
+# Then trigger a new voice input — Vox will recreate the session
+```
+
+### Step 6 — Grant permissions
 
 macOS will prompt for these on first use:
 - **Microphone** — prompted when user first records. Shows as "Vox".
-- **Screen Recording** — prompted when user says "can you see my screen". Shows as "Vox". If it only captures wallpaper, remove and re-add Vox in System Settings → Privacy → Screen Recording.
+- **Screen Recording** — prompted when user says "can you see my screen". Shows as "Vox". If it only captures wallpaper, remove and re-add Vox in System Settings > Privacy & Security > Screen Recording. The app also falls back to `screencapture` automatically.
 
 After granting Screen Recording, restart Vox:
 ```bash
@@ -134,12 +152,14 @@ pkill -f Vox; open /Applications/Vox.app
 
 - **Gatekeeper blocks unsigned apps**: Always run `xattr -cr /Applications/Vox.app` after installing
 - **Python 3.10 only**: Kokoro and faster-whisper don't work on 3.11+. `brew install python@3.10`
-- **Screen Recording shows wallpaper only**: Permission was granted to an old binary. Remove Vox from Screen Recording, re-add, restart Vox
+- **Screen Recording shows wallpaper only**: Permission was granted to an old binary. Remove Vox from Screen Recording, re-add, restart Vox. The app will automatically fall back to `screencapture` if the Swift capture only gets wallpaper
 - **"No such file or directory" for node**: Claude Code needs node in PATH. The app auto-discovers nvm paths, but if claude is installed elsewhere, check `which claude` and ensure its directory is in PATH
 - **Double speech**: If responses are spoken twice, check that `VOX_NO_HOOK=1` is set in the tmux session. The Claude Code Stop hook (`~/bin/claude-speak.py`) checks this env var and skips if set
 - **kokoro-server not starting**: Run `tail -20 /tmp/kokoro-server.log` to see errors. Common fix: `launchctl unload ~/Library/LaunchAgents/com.kokoro-server.plist && launchctl load ~/Library/LaunchAgents/com.kokoro-server.plist`
 - **Whisper model download**: First transcription downloads the Whisper base model (~140MB). Needs internet once, then works offline
-- **tmux session trust prompt**: On first launch, Claude Code asks to trust the workspace. Vox auto-accepts this, but if it gets stuck, run `tmux attach -t vox-claude` and accept manually
+- **tmux session trust prompt**: On first launch, Claude Code may show a trust prompt or a bypass-permissions acceptance prompt. Vox auto-accepts both, but if it gets stuck, run `tmux attach -t vox-claude` and accept manually
+- **Restarting Vox breaks the Claude session**: If Vox is killed (`pkill -f Vox`) or crashes, the tmux Claude session may die while the tmux window stays alive. Vox now detects this and recreates the session automatically, but if voice input stops working, run `tmux kill-session -t vox-claude` and try again
+- **Updating from source**: After pulling new code, you must copy changed files into the app bundle and restart: `cp app.py install.sh /Applications/Vox.app/Contents/Resources/ && pkill -f Vox && open /Applications/Vox.app`
 
 ---
 
