@@ -550,6 +550,7 @@ class VoxApp(rumps.App):
                 pass
 
             # Try 1: Swift helper (shows as "Vox" in permissions)
+            print("[vox] SCREENSHOT: Requesting Swift capture...", flush=True)
             try:
                 os.unlink("/tmp/vox-screenshot-done")
             except OSError:
@@ -564,22 +565,35 @@ class VoxApp(rumps.App):
             except OSError:
                 pass
 
-            # Try 2: Always try screencapture (Terminal usually has Screen Recording permission)
-            # Use it as primary since Swift helper loses permission on every re-sign
-            alt = "/tmp/vox-screen-alt.png"
-            subprocess.run(["screencapture", "-x", alt], capture_output=True)
-            if os.path.exists(alt) and os.path.getsize(alt) > 1000:
-                os.replace(alt, screenshot)
-                print("[vox] Using screencapture", flush=True)
-            elif os.path.exists(alt):
-                os.unlink(alt)
+            swift_size = os.path.getsize(screenshot) if os.path.exists(screenshot) else 0
+            print(f"[vox] SCREENSHOT: Swift capture size={swift_size}", flush=True)
 
-            if os.path.exists(screenshot) and os.path.getsize(screenshot) > 1000:
+            # Try 2: screencapture as fallback
+            alt = "/tmp/vox-screen-alt.png"
+            result = subprocess.run(["screencapture", "-x", alt], capture_output=True)
+            alt_size = os.path.getsize(alt) if os.path.exists(alt) else 0
+            print(f"[vox] SCREENSHOT: screencapture rc={result.returncode} size={alt_size}", flush=True)
+
+            if os.path.exists(alt) and alt_size > 1000:
+                os.replace(alt, screenshot)
+                print("[vox] SCREENSHOT: Using screencapture", flush=True)
+            else:
+                if os.path.exists(alt):
+                    os.unlink(alt)
+                # screencapture failed — check if Swift capture is wallpaper-only
+                # (Screen Recording permission was likely invalidated by a re-sign)
+                if swift_size > 0 and result.returncode != 0:
+                    notify("Vox — Screen Recording",
+                           "Screenshot may only show wallpaper. Open System Settings > Privacy & Security > Screen Recording, remove Vox, re-add it, then restart Vox.")
+                    print("[vox] SCREENSHOT: WARNING — likely wallpaper-only (permission invalidated)", flush=True)
+
+            final_size = os.path.getsize(screenshot) if os.path.exists(screenshot) else 0
+            if os.path.exists(screenshot) and final_size > 1000:
                 image_path = screenshot
-                print(f"[vox] screenshot ready ({os.path.getsize(screenshot)} bytes)", flush=True)
+                print(f"[vox] SCREENSHOT: ready ({final_size} bytes)", flush=True)
             else:
                 text += " (screen capture failed — grant Screen Recording permission to Vox in System Settings)"
-                print("[vox] screenshot failed", flush=True)
+                print(f"[vox] SCREENSHOT: failed (size={final_size})", flush=True)
 
         try:
             self.set_status("Thinking...")
