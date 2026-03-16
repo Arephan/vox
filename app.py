@@ -564,26 +564,15 @@ class VoxApp(rumps.App):
             except OSError:
                 pass
 
-            # Try 2: Fall back to screencapture
-            # Always try if Swift failed OR if Swift only captured wallpaper
-            # (wallpaper-only captures are valid large PNGs, so size check alone won't catch it)
-            swift_captured = os.path.exists(screenshot) and os.path.getsize(screenshot) > 1000
-            if not swift_captured:
-                print("[vox] Swift helper didn't capture, trying screencapture", flush=True)
-                subprocess.run(["screencapture", "-x", screenshot], capture_output=True)
-            else:
-                # Swift captured something, but try screencapture too and use the larger file
-                # (wallpaper-only is typically smaller than a full screen with windows)
-                alt = "/tmp/vox-screen-alt.png"
-                subprocess.run(["screencapture", "-x", alt], capture_output=True)
-                if os.path.exists(alt) and os.path.getsize(alt) > 1000:
-                    if os.path.getsize(alt) > os.path.getsize(screenshot):
-                        os.replace(alt, screenshot)
-                        print("[vox] Using screencapture (larger than Swift capture)", flush=True)
-                    else:
-                        os.unlink(alt)
-                elif os.path.exists(alt):
-                    os.unlink(alt)
+            # Try 2: Always try screencapture (Terminal usually has Screen Recording permission)
+            # Use it as primary since Swift helper loses permission on every re-sign
+            alt = "/tmp/vox-screen-alt.png"
+            subprocess.run(["screencapture", "-x", alt], capture_output=True)
+            if os.path.exists(alt) and os.path.getsize(alt) > 1000:
+                os.replace(alt, screenshot)
+                print("[vox] Using screencapture", flush=True)
+            elif os.path.exists(alt):
+                os.unlink(alt)
 
             if os.path.exists(screenshot) and os.path.getsize(screenshot) > 1000:
                 image_path = screenshot
