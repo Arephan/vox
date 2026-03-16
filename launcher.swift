@@ -78,11 +78,6 @@ class VoxHelper: NSObject, NSApplicationDelegate {
         let stopKeyID = EventHotKeyID(signature: OSType(0x564F5822), id: 2)
         RegisterEventHotKey(0x01, modifiers, stopKeyID, GetApplicationEventTarget(), 0, &stopKeyRef)
 
-        // Register Option+Shift+R — restart kokoro (key code 0x0F = 'r')
-        var restartKeyRef: EventHotKeyRef?
-        let restartKeyID = EventHotKeyID(signature: OSType(0x564F5823), id: 3)
-        RegisterEventHotKey(0x0F, modifiers, restartKeyID, GetApplicationEventTarget(), 0, &restartKeyRef)
-
         // Register Option+Shift+R — restart Kokoro TTS (key code 0x0F = 'r')
         var restartKeyRef: EventHotKeyRef?
         let restartKeyID = EventHotKeyID(signature: OSType(0x564F5823), id: 3)
