@@ -439,6 +439,26 @@ class VoxApp(rumps.App):
             self.last_signal_state = signal_exists
             self.toggle_recording(None)
 
+        if os.path.exists("/tmp/vox-restart-kokoro"):
+            try:
+                os.unlink("/tmp/vox-restart-kokoro")
+            except OSError:
+                pass
+            threading.Thread(target=self._restart_kokoro, daemon=True).start()
+
+    def _restart_kokoro(self):
+        self.set_status("Restarting Kokoro...")
+        stop_speech()
+        subprocess.run(["pkill", "-f", "kokoro-server.py"], capture_output=True)
+        time.sleep(2)
+        python_path = "/Users/hankim/kokoro-env/bin/python3.10"
+        server_path = "/Users/hankim/bin/kokoro-server.py"
+        subprocess.Popen([python_path, server_path],
+                         stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+        time.sleep(6)
+        self.set_status("Ready")
+
     def set_status(self, text):
         print(f"[vox] {text}", flush=True)
         for item in self.menu.values():

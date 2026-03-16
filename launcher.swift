@@ -78,6 +78,11 @@ class VoxHelper: NSObject, NSApplicationDelegate {
         let stopKeyID = EventHotKeyID(signature: OSType(0x564F5822), id: 2)
         RegisterEventHotKey(0x01, modifiers, stopKeyID, GetApplicationEventTarget(), 0, &stopKeyRef)
 
+        // Register Option+Shift+R — restart Kokoro TTS (key code 0x0F = 'r')
+        var restartKeyRef: EventHotKeyRef?
+        let restartKeyID = EventHotKeyID(signature: OSType(0x564F5823), id: 3)
+        RegisterEventHotKey(0x0F, modifiers, restartKeyID, GetApplicationEventTarget(), 0, &restartKeyRef)
+
         // Single event handler that dispatches based on hotkey ID
         var eventSpec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
         InstallEventHandler(GetApplicationEventTarget(), { (_, event, _) -> OSStatus in
@@ -104,6 +109,9 @@ class VoxHelper: NSObject, NSApplicationDelegate {
                     s.close()
                     " 2>/dev/null
                     """]
+            } else if hotkeyID.id == 3 {
+                // Restart Kokoro
+                task.arguments = ["-c", "touch /tmp/vox-restart-kokoro"]
             }
 
             try? task.run()
@@ -166,7 +174,7 @@ class VoxHelper: NSObject, NSApplicationDelegate {
             }
         }
 
-        NSLog("[vox] Vox running — Opt+Shift+A to talk, Opt+Shift+S to stop speech")
+        NSLog("[vox] Vox running — Opt+Shift+A to talk, Opt+Shift+S to stop speech, Opt+Shift+R to restart Kokoro")
     }
 
     func takeScreenshot() {
