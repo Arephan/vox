@@ -147,6 +147,7 @@ class VoxHelper: NSObject, NSApplicationDelegate {
         let currentPath = env["PATH"] ?? "/usr/bin:/bin"
         env["PATH"] = nodePaths.joined(separator: ":") + ":" + currentPath
         python.environment = env
+        FileManager.default.createFile(atPath: "/tmp/vox-debug.log", contents: nil)
         python.standardOutput = FileHandle(forWritingAtPath: "/tmp/vox-debug.log") ?? FileHandle.nullDevice
         python.standardError = python.standardOutput
         do {

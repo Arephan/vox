@@ -340,8 +340,7 @@ def query_claude_tmux(text, image_path=None):
     subprocess.run(["tmux", "send-keys", "-t", TMUX_SESSION, "-l", text])
     subprocess.run(["tmux", "send-keys", "-t", TMUX_SESSION, "Enter"])
 
-    first_spoken = False
-    spoken_text = ""
+    spoken_up_to = 0
     start = time.time()
     last_response = ""
 
@@ -357,27 +356,30 @@ def query_claude_tmux(text, image_path=None):
             if response and response != last_response:
                 last_response = response
 
-                # Speak as soon as we have ANY text — don't wait for full sentence
-                if not first_spoken and len(response) > 10:
-                    m = re.search(r'[.!?,;:]\s', response)
-                    if m:
-                        speak(response[:m.end()])
-                        spoken_text = response[:m.end()]
-                        first_spoken = True
-                    elif len(response) > 80:
-                        # No punctuation yet, speak what we have
-                        speak(response)
-                        spoken_text = response
-                        first_spoken = True
+                # Find sentence boundaries in the new text (only full sentences: . ! ?)
+                unseen = response[spoken_up_to:]
+                sentences = re.findall(r'[^.!?]*[.!?]', unseen)
+                if sentences:
+                    to_speak = ''.join(sentences).strip()
+                    if to_speak:
+                        if spoken_up_to == 0:
+                            speak(to_speak)
+                        else:
+                            speak_append(to_speak)
+                        spoken_up_to += len(''.join(sentences))
 
             # Check if Claude is done
             if _is_prompt_ready(pane) and response:
-                if not first_spoken:
-                    speak(response)
-                else:
-                    remaining = response[len(spoken_text):].strip()
-                    if remaining:
+                # Speak any remaining text that didn't end with punctuation
+                remaining = response[spoken_up_to:].strip()
+                if remaining:
+                    if spoken_up_to == 0:
+                        speak(remaining)
+                    else:
                         speak_append(remaining)
+                elif spoken_up_to == 0:
+                    # Nothing was spoken at all
+                    speak(response)
                 # Show response as notification
                 notify("Vox", response[:150])
                 print(f"[vox] done: {response[:80]}", flush=True)
@@ -385,7 +387,7 @@ def query_claude_tmux(text, image_path=None):
 
         time.sleep(0.1)
 
-    if not first_spoken:
+    if spoken_up_to == 0:
         speak("Sorry, that took too long.")
     return last_response or "timeout"
 
