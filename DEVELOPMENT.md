@@ -1,107 +1,139 @@
 # Vox Development Notes
 
+## Quick Setup for AI Agents
+
+> If you're an AI on another computer setting this up, read the README.md "For AI Agents" section first. This file has deeper context.
+
 ## Architecture
 
-Vox runs as **two processes** launched from one `Vox.app`:
+Vox runs as **three processes**:
 
-1. **Swift binary** (`launcher.swift` → `Vox.app/Contents/MacOS/Vox`)
-   - Registers global hotkey via Carbon `RegisterEventHotKey` (no Accessibility permission needed)
-   - Polls `/tmp/vox-screenshot-request` and takes screenshots via `CGDisplayCreateImage`
+1. **Swift binary** (`Vox.app/Contents/MacOS/Vox`)
+   - Registers global hotkeys via Carbon (no Accessibility permission needed)
+   - Option+Shift+A = toggle recording, Option+Shift+S = stop speech
+   - Takes screenshots via `CGDisplayCreateImage` (shows as "Vox" in Screen Recording permissions)
    - Launches the Python menu bar app as a child process
-   - Monitors Python — if it dies, Swift exits too
+   - Starts kokoro-server if not running
+   - Runs first-time installer if dependencies missing
 
-2. **Python app** (`app.py` → runs inside `Vox.app/Contents/Resources/app.py`)
-   - Menu bar UI via `rumps`
-   - STT via `faster-whisper` (base model, kept loaded for speed)
-   - Routes to Claude Code via `claude -p` subprocess
+2. **Python menu bar app** (`app.py`)
+   - Menu bar UI via `rumps` (shows 🎙 icon)
+   - STT via `faster-whisper` (base model, kept loaded in memory)
+   - Communicates with Claude via persistent tmux session
    - TTS via kokoro-server Unix socket
-   - Polls `/tmp/vox-recording` signal file for hotkey toggle
+   - Polls `/tmp/vox-recording` at 50ms for hotkey toggle
+   - Model selection menu (Auto/Haiku/Sonnet/Opus) sends `/model` to tmux
 
-## Communication between processes
+3. **Kokoro TTS server** (`~/bin/kokoro-server.py`)
+   - launchd daemon, auto-starts on login
+   - Keeps Kokoro model warm in memory
+   - Accepts `speak`, `speak_append`, `stop` commands via Unix socket `/tmp/kokoro-tts.sock`
+   - Callback-based audio stream with deque buffer (no crackling)
+   - Voice: `af_heart`, speed: `1.15`
 
-- **Hotkey toggle**: Swift creates/removes `/tmp/vox-recording`, Python polls it every 0.3s via `rumps.Timer`
-- **Screenshot request**: Python creates `/tmp/vox-screenshot-request`, Swift takes screenshot to `/tmp/vox-screen.png`, creates `/tmp/vox-screenshot-done` when ready
-- **TTS**: Python sends JSON to kokoro-server via Unix socket at `/tmp/kokoro-tts.sock`
+## Communication
 
-## Critical gotchas
+- **Hotkey** → Swift creates/removes `/tmp/vox-recording` → Python polls at 50ms
+- **Screenshot** → Python creates `/tmp/vox-screenshot-request` → Swift captures → creates `/tmp/vox-screenshot-done`
+- **Screenshot fallback** → If Swift capture fails, Python falls back to `screencapture -x` command
+- **TTS** → Python sends JSON to kokoro-server via Unix socket `/tmp/kokoro-tts.sock`
+- **Claude** → Python sends text via `tmux send-keys` to persistent `vox-claude` tmux session, polls `tmux capture-pane` at 100ms for responses
 
-### macOS permissions
-- **Screen Recording**: Tied to the app's code signature. Every time you rebuild and re-sign `Vox.app`, the old permission is invalidated. User must re-grant it. Use `tccutil reset ScreenCapture com.arephan.vox` to force a fresh prompt on next launch.
-- **Microphone**: Granted per-app via the `NSMicrophoneUsageDescription` plist key. Shows as "Vox" automatically.
-- **Accessibility**: NOT needed. We use Carbon `RegisterEventHotKey` which bypasses Accessibility entirely. Do NOT use `pynput` for hotkeys — it requires Accessibility and shows as "Python" not "Vox".
-- **Gatekeeper**: Downloaded apps get quarantined. Users need `xattr -cr /Applications/Vox.app` to open unsigned builds.
+## Claude tmux session
 
-### PATH issues
-- When launched via `open Vox.app`, the PATH is minimal — no nvm, no homebrew.
-- `claude` is a Node.js script installed via nvm, so both `claude` AND `node` must be in PATH.
-- Fixed by: (1) `find_claude()` in Python searches nvm directories, (2) adds the claude binary's directory to PATH so `node` is found too.
-- The Swift launcher also injects nvm paths into the environment before launching Python.
+- Session name: `vox-claude`
+- Launched with `--dangerously-skip-permissions` (no permission prompts)
+- System prompt tells Claude it has full machine access
+- `VOX_NO_HOOK=1` prevents the Claude Code Stop hook from double-speaking
+- Auto-accepts trust prompts and bypass-permissions prompts
+- `_is_claude_alive()` checks if Claude is responsive (not just if tmux session exists)
+- If Claude dies but tmux stays, it kills the session and recreates
 
-### PyInstaller issues (abandoned)
-- PyInstaller builds caused memory leaks — the bundled Python runtime + faster-whisper model consumed 1GB+.
-- PyInstaller bundled `pynput` had callback signature mismatches (`GlobalHotKeys._on_press() missing 1 required positional argument: 'injected'`).
-- `rumps` menu callbacks didn't fire in PyInstaller builds.
-- **Decision**: Use native Swift wrapper + Python script instead. Much lighter, more reliable.
+## Response parsing from tmux
 
-### Process lifecycle
-- The Swift launcher must NOT call `python.waitUntilExit()` on the main thread — it blocks the Carbon event loop and kills hotkey/screenshot functionality.
-- Instead, monitor Python exit on a background `DispatchQueue` and terminate the Swift app when Python dies.
-- The `/tmp/vox-debug.log` file handle must exist before Swift launches Python (Swift opens it for stdout/stderr redirect).
+This is the trickiest part. Claude Code's terminal output has:
+- `⏺` marks the start of Claude's response blocks
+- `❯` is the input prompt (empty `❯` on its own line = Claude is done)
+- `⏵⏵` is the status bar at the bottom
+- Tool use blocks start with `⏺ Bash(...)`, `⏺ Read ...`, `⏺ Edit ...`, etc.
+- Status text appears briefly: "Boogieing", "Moonwalking", "Shimmy", "Sublimating", etc.
+- Hook status: "Running stop hook", "bypass permissions on"
+
+**What we filter out** (SKIP_PREFIXES and SKIP_CONTENT in app.py):
+- Tool use: Read, Reading, Wrote, Ran, Search, plugin:, Edit, Bash, Bash(, Glob, Grep, Write, Agent, Task, LSP
+- Status: running stop, hook, bypass permissions, mcp server, shift+tab, boogieing, thinking, moonwalking, grooving, vibing, shimmy, sublimating, breakdancing, ctrl+o, expand, /tmp/, ✻, ─────, file changed
+
+**Response tracking**: Count `⏺` blocks before sending message. Only extract text from blocks with index > before_count. This prevents speaking old responses.
+
+**Sentence streaming**: Speak complete sentences (ending in `.!?`) as they appear. Use `speak()` for first sentence, `speak_append()` for rest. If Claude is done and text remains without punctuation, speak it anyway.
+
+## Critical Gotchas
+
+### macOS Permissions
+- **Screen Recording** is tied to the app's **code signature**. Every `codesign --force` invalidates it. User must re-grant. Use `tccutil reset ScreenCapture com.arephan.vox` to force a fresh prompt
+- **Microphone** survives re-signing
+- **Accessibility** is NOT needed — Carbon `RegisterEventHotKey` bypasses it
+- **Gatekeeper**: `xattr -cr /Applications/Vox.app` required after every install from DMG
+
+### PATH Issues
+- When launched via `open Vox.app`, PATH is minimal — no nvm, no homebrew
+- Claude Code needs both `claude` AND `node` in PATH
+- Swift launcher injects nvm paths into environment
+- Python app uses `_find_claude()` which searches nvm dirs, then adds claude's dir to PATH
+
+### Install Script
+- Line endings matter — `\r` characters from Write tool cause `set -e` to fail
+- Always `sed -i '' 's/\r$//'` on bundled scripts
+- Script uses `$REPO_DIR` which resolves to Vox.app/Contents/Resources/ when run from bundle
+- Installs: kokoro-server.py, claude-speak.py, kokoro-stop.sh to ~/bin
+- Creates launchd plist at ~/Library/LaunchAgents/com.kokoro-server.plist
+- Adds `shh` alias to ~/.zshrc
 
 ### Kokoro TTS
-- Default voice: `af_heart`, speed: `1.15`
-- Server runs as launchd daemon at `~/Library/LaunchAgents/com.kokoro-server.plist`
-- Model takes ~8 seconds to load on startup
-- Audio uses callback-based `sd.OutputStream` with a deque sample buffer to prevent crackling
-- First sentence synthesized alone for low latency, remaining batched in groups of 3
+- Model: Kokoro-82M, loads in ~8 seconds
+- Requires Python 3.10 (not 3.11+)
+- `PYTORCH_ENABLE_MPS_FALLBACK=1` required
+- `speak_append` waits for current speech to finish, then plays (no interruption)
+- `speak` stops current speech and plays immediately
 
 ### Whisper STT
-- Using `base` model (not `small`) for speed — transcription in ~1-2 seconds
-- Model kept loaded in memory (~140MB) for fast response
-- If memory is a concern, can load/unload per transcription (adds ~4 seconds latency)
-- Requires Python 3.10 — faster-whisper/ctranslate2 don't support 3.11+
+- Using `base` model (~140MB) for speed
+- First use downloads model from HuggingFace (needs internet once)
+- Kept loaded in memory (~140MB RAM)
+- `ctranslate2` float16 warning is harmless — auto-converts to float32
 
-### Claude API integration
-- **Current approach (fast)**: Uses Anthropic Python SDK directly with Claude Code's OAuth token
-- OAuth token extracted from macOS Keychain: `security find-generic-password -s "Claude Code-credentials" -w`
-- Requires header `anthropic-beta: oauth-2025-04-20` for OAuth auth to work
-- Streams responses via `_client.messages.stream()` — speaks first sentence as soon as it arrives
-- Uses `speak()` for first sentence, `speak_append()` for remaining text
-- Haiku for conversation (fast), Sonnet for work tasks (detects keywords like "build", "create", "fix", "code")
-- **Important**: No conversation persistence yet — each call is stateless. Need to implement message history.
+### OAuth Token
+- Claude Code stores OAuth token in macOS Keychain: `security find-generic-password -s "Claude Code-credentials" -w`
+- Requires `anthropic-beta: oauth-2025-04-20` header
+- Used for API streaming (fast path) and warmup ping
+- Falls back to `ANTHROPIC_API_KEY` env var if no OAuth
 
-#### Previous approaches (abandoned)
-- `claude -p` subprocess: Too slow (2-5 seconds before any output), no streaming
-- `claude -p --continue`: Loaded heavy session context, often timed out
-- `claude -p --output-format stream-json --verbose`: Worked but still slower than direct API
-- OAuth without `anthropic-beta` header: Returns 401 authentication error
+### Double Speech Prevention
+- Claude Code has a Stop hook (`~/bin/claude-speak.py`) that speaks every response
+- The tmux session sets `VOX_NO_HOOK=1` so the hook skips
+- But: the hook checks `os.environ.get("VOX_NO_HOOK")` — only works if Claude Code passes parent env to hooks
 
-### Screenshot for screen sharing
-- Only triggered when user says keywords: "see my screen", "look at this", "what do you see", etc.
-- Screenshot taken by Swift helper via `CGDisplayCreateImage` (shows as "Vox" in permissions)
-- Sent to Claude as base64 PNG in the API call
-- Cleaned up after each use
+### PyInstaller (abandoned)
+- Caused memory leaks (1GB+ for bundled Python + models)
+- `pynput` callback signature mismatches in bundle
+- `rumps` menu callbacks didn't fire
+- **Decision**: Use native Swift wrapper + Python script instead
 
-## File structure
+## File Structure
 
 ```
 vox/
-├── app.py              # Python menu bar app (STT, Claude, TTS orchestration)
-├── launcher.swift      # Swift binary (hotkey, screenshots, process launcher)
-├── install.sh          # First-launch installer (kokoro-env, dependencies, launchd)
-├── vox-toggle.sh       # Hotkey signal script
-├── setup.py            # py2app setup (unused, kept for reference)
-├── README.md           # User-facing docs
+├── app.py              # Python menu bar app
+├── launcher.swift      # Swift binary (hotkeys, screenshots, process launcher)
+├── install.sh          # First-launch installer
+├── kokoro-server.py    # TTS server (copied to ~/bin on install)
+├── claude-speak.py     # Claude Code Stop hook (copied to ~/bin on install)
+├── kokoro-stop.sh      # Stop speech script
+├── Vox.icns            # App icon
+├── Vox.dmg             # Built DMG (not in git)
+├── README.md           # User + AI agent docs
 └── DEVELOPMENT.md      # This file
 ```
-
-## Dependencies (installed to ~/kokoro-env)
-
-- kokoro (TTS)
-- faster-whisper (STT)
-- sounddevice, soundfile, numpy (audio I/O)
-- rumps (menu bar UI)
-- ctranslate2 (whisper backend)
 
 ## Building
 
@@ -110,21 +142,23 @@ vox/
 swiftc launcher.swift -o Vox -framework Cocoa -framework Carbon -framework CoreGraphics
 
 # Build Vox.app bundle
-mkdir -p Vox.app/Contents/{MacOS,Resources}
-cp Vox Vox.app/Contents/MacOS/
-cp app.py install.sh Vox.app/Contents/Resources/
-# Add Info.plist with LSUIElement, NSMicrophoneUsageDescription, NSScreenCaptureUsageDescription
-codesign --force --deep --sign - Vox.app
+APP="dist/Vox.app"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+cp Vox "$APP/Contents/MacOS/"
+cp app.py install.sh kokoro-server.py claude-speak.py kokoro-stop.sh Vox.icns "$APP/Contents/Resources/"
+# Add Info.plist (see existing for template)
+codesign --force --deep --sign - "$APP"
 
 # Create DMG
-mkdir /tmp/vox-dmg
-cp -R Vox.app /tmp/vox-dmg/
-ln -s /Applications /tmp/vox-dmg/Applications
+mkdir /tmp/vox-dmg && cp -R "$APP" /tmp/vox-dmg/ && ln -s /Applications /tmp/vox-dmg/Applications
 hdiutil create -volname "Vox" -srcfolder /tmp/vox-dmg -format UDZO Vox.dmg
+
+# IMPORTANT: After re-signing, Screen Recording permission is invalidated
+# Run: tccutil reset ScreenCapture com.arephan.vox
 ```
 
-## Related projects
+## Related Projects
 
-- **claude-voice** (https://github.com/Arephan/claude-voice) — Claude Code plugin for TTS-only (no STT, no menu bar). Simpler, just speaks responses aloud.
-- **Telegram bot** (`~/bin/telegram-claude-bot.py`) — Telegram interface to Claude with voice responses. Bot token in the script.
-- **Shared todo app** (`~/projects/shared-todo/server.py`) — localhost:3456, shared between user and Claude.
+- **claude-voice** (github.com/Arephan/claude-voice) — Claude Code plugin for TTS-only
+- **Telegram bot** (`~/bin/telegram-claude-bot.py`) — Telegram voice interface to Claude
+- **Shared todo** (`~/projects/shared-todo/server.py`) — localhost:3456
