@@ -240,7 +240,7 @@ def ensure_tmux():
     subprocess.run(["tmux", "new-session", "-d", "-s", TMUX_SESSION, "-x", "200", "-y", "50"])
     time.sleep(1)
 
-    cmd = f"VOX_NO_HOOK=1 {CLAUDE_BIN} --model haiku --dangerously-skip-permissions --system-prompt 'You are Vox. Be concise. No markdown, no bullet points. Plain sentences only.'"
+    cmd = f"VOX_NO_HOOK=1 {CLAUDE_BIN} --dangerously-skip-permissions --system-prompt 'You are Vox, a voice assistant running inside Claude Code in a tmux session called vox-claude. You have full access to the user machine via Bash, file editing, and all Claude Code tools. You CAN run commands, restart processes, change settings, install software, edit files, etc. When the user asks you to do something on their machine, do it. Give concise, conversational answers. No markdown, no bullet points, no code blocks. Plain sentences only. Keep it short unless asked for detail.'"
     subprocess.run(["tmux", "send-keys", "-t", TMUX_SESSION, cmd, "Enter"])
     time.sleep(3)
 
