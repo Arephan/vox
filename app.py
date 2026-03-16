@@ -404,6 +404,8 @@ class VoxApp(rumps.App):
         self.busy = False
         self.last_signal_state = False
         self.current_model = "auto"
+        self.current_audio_device = None
+        self._update_audio_devices()
 
         self.menu = [
             rumps.MenuItem("Talk", callback=self.toggle_recording),
@@ -416,8 +418,9 @@ class VoxApp(rumps.App):
             rumps.MenuItem("    Sonnet (balanced)", callback=self.set_model_sonnet),
             rumps.MenuItem("    Opus (powerful)", callback=self.set_model_opus),
             None,
-            rumps.MenuItem("Stop Speech", callback=self.on_stop_speech),
+            rumps.MenuItem("Audio Output: System Default", callback=None),
         ]
+        self._rebuild_audio_menu()
         try:
             os.unlink("/tmp/vox-recording")
         except OSError:
@@ -459,10 +462,78 @@ class VoxApp(rumps.App):
                 item.title = f"Model: {labels[self.current_model].split(' (')[0]}"
                 break
 
+    def _switch_tmux_model(self, model):
+        """Send /model command to tmux Claude session."""
+        if model != "auto":
+            subprocess.run(["tmux", "send-keys", "-t", TMUX_SESSION, f"/model {model}", "Enter"],
+                          capture_output=True)
+            print(f"[vox] Switched tmux model to {model}", flush=True)
+
     def set_model_auto(self, _): self.current_model = "auto"; self._update_model_menu()
-    def set_model_haiku(self, _): self.current_model = "haiku"; self._update_model_menu()
-    def set_model_sonnet(self, _): self.current_model = "sonnet"; self._update_model_menu()
-    def set_model_opus(self, _): self.current_model = "opus"; self._update_model_menu()
+    def set_model_haiku(self, _): self.current_model = "haiku"; self._update_model_menu(); self._switch_tmux_model("haiku")
+    def set_model_sonnet(self, _): self.current_model = "sonnet"; self._update_model_menu(); self._switch_tmux_model("sonnet")
+    def set_model_opus(self, _): self.current_model = "opus"; self._update_model_menu(); self._switch_tmux_model("opus")
+
+    def _update_audio_devices(self):
+        """Get list of available output devices."""
+        try:
+            devices = sd.query_devices()
+            self.audio_devices = {}
+            for i, d in enumerate(devices):
+                if d['max_output_channels'] > 0:
+                    self.audio_devices[d['name']] = i
+        except Exception as e:
+            print(f"[vox] Error getting audio devices: {e}", flush=True)
+            self.audio_devices = {}
+
+    def _rebuild_audio_menu(self):
+        """Rebuild audio output menu items."""
+        self._update_audio_devices()
+
+        # Remove old audio items
+        to_remove = []
+        for item in self.menu.values():
+            if isinstance(item, rumps.MenuItem) and (item.title.startswith("Audio Output:") or item.title.startswith("    ")):
+                if any(dev in item.title for dev in self.audio_devices.keys()):
+                    to_remove.append(item)
+        for item in to_remove:
+            del self.menu[item.title]
+
+        # Add audio device menu items
+        for device_name in self.audio_devices.keys():
+            is_current = device_name == self.current_audio_device
+            prefix = "  ✓ " if is_current else "    "
+            self.menu[f"{prefix}{device_name}"] = rumps.MenuItem(
+                f"{prefix}{device_name}",
+                callback=lambda _, d=device_name: self._set_audio_device(d)
+            )
+
+        # Update header
+        header_name = self.current_audio_device or "System Default"
+        for item in self.menu.values():
+            if isinstance(item, rumps.MenuItem) and item.title.startswith("Audio Output:"):
+                item.title = f"Audio Output: {header_name}"
+                break
+
+    def _set_audio_device(self, device_name):
+        """Set audio output device and restart server."""
+        self.current_audio_device = device_name
+        self._rebuild_audio_menu()
+        self.set_status(f"Restarting server for {device_name}...")
+
+        # Restart kokoro-server in background
+        def restart_server():
+            subprocess.run(["pkill", "-f", "kokoro-server"])
+            time.sleep(1)
+            server_path = "/Users/hankim/projects/vox/kokoro-server.py"
+            python_path = "/Users/hankim/kokoro-env/bin/python3.10"
+            subprocess.Popen([python_path, server_path],
+                           stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL)
+            time.sleep(5)
+            self.set_status("Ready")
+
+        threading.Thread(target=restart_server, daemon=True).start()
 
     def toggle_recording(self, sender):
         if self.busy:
